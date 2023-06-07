@@ -1,0 +1,5 @@
+/._bad
+/build
+/.vscode/**
+
+!/.vscode/launch.json

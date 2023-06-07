@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Pico launch",
+      "type": "cortex-debug",
+      "executable": "./build/PicoJoybus.elf",
+      "request": "launch",
+      "servertype": "external",
+      "gdbTarget": "host.docker.internal:3333",
+      "gdbPath": "arm-none-eabi-gdb",
+      "svdFile": "${env:PICO_SDK_PATH}/src/rp2040/hardware_regs/rp2040.svd",
+      "runToEntryPoint": "main",
+      "preLaunchTask": "build"
+    },
+    {
+      "name": "Pico attach",
+      "type": "cortex-debug",
+      "executable": "./build/PicoJoybus.elf",
+      "request": "attach",
+      "servertype": "external",
+      "gdbTarget": "host.docker.internal:3333",
+      "gdbPath": "arm-none-eabi-gdb",
+      "svdFile": "${env:PICO_SDK_PATH}/src/rp2040/hardware_regs/rp2040.svd"
+    }
+  ]
+}
