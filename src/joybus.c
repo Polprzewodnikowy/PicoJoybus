@@ -11,6 +11,7 @@
 
 typedef struct {
     uint sm;
+    bool tx_busy;
     struct {
         uint id;
         dma_channel_config rx, tx;
@@ -88,19 +89,18 @@ static void __time_critical_func(joybus_finish_receive_data) (uint ch) {
 
 static void __time_critical_func(joybus_start_receive_data) (uint ch) {
     joybus_channel_t *channel = &joybus->channel[ch];
+    dma_channel_abort(channel->dma.id);
     dma_channel_set_config(channel->dma.id, &channel->dma.rx, false);
     dma_channel_set_read_addr(channel->dma.id, &joybus->pio->rxf[channel->sm], false);
-    dma_channel_set_irq0_enabled(channel->dma.id, false);
     dma_channel_transfer_to_buffer_now(channel->dma.id, channel->rx.data, JOYBUS_BUFFER_SIZE);
 }
 
 static void __time_critical_func(joybus_start_transmit_data) (uint ch) {
     joybus_channel_t *channel = &joybus->channel[ch];
-    uint32_t transfer_count = (sizeof(channel->tx.length) + channel->tx.length);
+    pio_sm_put(joybus->pio, channel->sm, channel->tx.length * 8);
     dma_channel_set_config(channel->dma.id, &channel->dma.tx, false);
     dma_channel_set_write_addr(channel->dma.id, &joybus->pio->txf[channel->sm], false);
-    dma_channel_set_irq0_enabled(channel->dma.id, true);
-    dma_channel_transfer_from_buffer_now(channel->dma.id, &channel->tx, transfer_count);
+    dma_channel_transfer_from_buffer_now(channel->dma.id, channel->tx.data, channel->tx.length);
     uint jmp_to_tx_start = pio_encode_jmp(joybus->offset + joybus_offset_tx_start);
     pio_sm_exec_wait_blocking(joybus->pio, channel->sm, jmp_to_tx_start);
 }
@@ -109,22 +109,19 @@ static void __time_critical_func(joybus_pio_irq_handler) (void) {
     for (uint8_t ch = 0; ch < joybus->channels; ch += 1) {
         if (pio_interrupt_get(joybus->pio, joybus->channel[ch].sm)) {
             pio_interrupt_clear(joybus->pio, joybus->channel[ch].sm);
-            joybus_finish_receive_data(ch);
-            joybus_process_packet(ch);
-            if (joybus->channel[ch].tx.length == 0) {
+            if (joybus->channel[ch].tx_busy) {
+                joybus->channel[ch].tx_busy = false;
                 joybus_start_receive_data(ch);
             } else {
-                joybus_start_transmit_data(ch);
+                joybus_finish_receive_data(ch);
+                joybus_process_packet(ch);
+                if (joybus->channel[ch].tx.length > 0) {
+                    joybus->channel[ch].tx_busy = true;
+                    joybus_start_transmit_data(ch);
+                } else {
+                    joybus_start_receive_data(ch);
+                }
             }
-        }
-    }
-}
-
-static void __time_critical_func(joybus_dma_irq_handler) (void) {
-    for (uint8_t ch = 0; ch < joybus->channels; ch += 1) {
-        if (dma_channel_get_irq0_status(joybus->channel[ch].dma.id)) {
-            dma_channel_acknowledge_irq0(joybus->channel[ch].dma.id);
-            joybus_start_receive_data(ch);
         }
     }
 }
@@ -192,15 +189,11 @@ void joybus_init (PIO pio, uint8_t channels, uint *pins, joybus_callback_t callb
 
     for (uint8_t ch = 0; ch < joybus->channels; ch += 1) {
         joybus->channel[ch].sm = pio_claim_unused_sm(joybus->pio, true);
+        joybus->channel[ch].tx_busy = false;
         joybus_dma_init(joybus->pio, &joybus->channel[ch]);
         joybus_program_init(joybus->pio, joybus->channel[ch].sm, joybus->offset, pins[ch]);
         joybus_start_receive_data(ch);
     }
-
-    joybus->irq.dma = DMA_IRQ_0;
-    irq_add_shared_handler(joybus->irq.dma, joybus_dma_irq_handler, PICO_SHARED_IRQ_HANDLER_HIGHEST_ORDER_PRIORITY);
-    irq_set_priority(joybus->irq.dma, PICO_HIGHEST_IRQ_PRIORITY);
-    irq_set_enabled(joybus->irq.dma, true);
 
     joybus->irq.pio = pio_get_index(joybus->pio) == 0 ? PIO0_IRQ_0 : PIO1_IRQ_0;
     irq_add_shared_handler(joybus->irq.pio, joybus_pio_irq_handler, PICO_SHARED_IRQ_HANDLER_HIGHEST_ORDER_PRIORITY);

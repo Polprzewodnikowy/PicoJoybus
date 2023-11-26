@@ -1,19 +1,23 @@
-#include <inttypes.h>
-#include <stdio.h>
 #include <btstack_tlv.h>
-#include <pico/stdlib.h>
+#include <inttypes.h>
 #include <pico/cyw43_arch.h>
+#include <pico/stdlib.h>
+#include <stdio.h>
 
-#include "btstack.h"
 #include "btstack_config.h"
+#include "btstack.h"
 #include "joybus.h"
 
 
-static volatile bool joybus_enabled = false;
-static volatile uint32_t joybus_state = 0;
+static volatile uint32_t controller_state = 0;
+static uint8_t controller_pak[32 * 1024];
+static volatile bool rumble_on = false;
+static enum { ACC_NONE, ACC_CPAK, ACC_RPAK } accessory_inserted = ACC_RPAK;
 
 static uint8_t __time_critical_func(joybus_callback) (uint8_t ch, uint8_t cmd, uint8_t rx_length, uint8_t *rx_buffer, uint8_t *tx_buffer) {
     uint8_t tx_length = 0;
+    uint16_t address_with_crc = (rx_buffer[0] << 8) | rx_buffer[1];
+    uint16_t address = address_with_crc & 0xFFE0;
 
     if (ch > 0) {
         return 0;
@@ -21,8 +25,10 @@ static uint8_t __time_critical_func(joybus_callback) (uint8_t ch, uint8_t cmd, u
 
     switch (cmd) {
         case JOYBUS_CMD_INFO:
+        case JOYBUS_CMD_RESET:
             if (rx_length == 0) {
-                uint32_t info = 0x050002;
+                uint32_t info = 0x050000 | ((accessory_inserted == ACC_NONE) ? 0x02 : 0x01);
+
                 tx_length = 3;
                 tx_buffer[0] = ((info >> 16) & 0xFF);
                 tx_buffer[1] = ((info >> 8) & 0xFF);
@@ -31,14 +37,66 @@ static uint8_t __time_critical_func(joybus_callback) (uint8_t ch, uint8_t cmd, u
             break;
 
         case JOYBUS_CMD_STATE:
-        case JOYBUS_CMD_RESET:
             if (rx_length == 0) {
                 tx_length = 4;
-                tx_buffer[0] = ((joybus_state >> 24) & 0xFF);
-                tx_buffer[1] = ((joybus_state >> 16) & 0xFF);
-                tx_buffer[2] = ((joybus_state >> 8) & 0xFF);
-                tx_buffer[3] = (joybus_state & 0xFF);
+                tx_buffer[0] = ((controller_state >> 24) & 0xFF);
+                tx_buffer[1] = ((controller_state >> 16) & 0xFF);
+                tx_buffer[2] = ((controller_state >> 8) & 0xFF);
+                tx_buffer[3] = (controller_state & 0xFF);
             }
+            break;
+
+        case JOYBUS_CMD_READ:
+            if ((rx_length == 2) && joybus_check_address_crc(address_with_crc)) {
+                tx_length = 33;
+                switch (accessory_inserted) {
+                    case ACC_NONE:
+                        memset(tx_buffer, 0x00, 32);
+                        break;
+
+                    case ACC_CPAK:
+                        if (address < 32 * 1024) {
+                            memcpy(tx_buffer, controller_pak + address, 32);
+                        } else {
+                            memset(tx_buffer, 0x00, 32);
+                        }
+                        break;
+
+                    case ACC_RPAK:
+                        memset(tx_buffer, (address & 0xC000) == 0x8000 ? 0x80 : 0x00, 32);
+                        break;
+                }
+                tx_buffer[32] = joybus_calculate_data_crc(tx_buffer);
+            }
+            break;
+
+        case JOYBUS_CMD_WRITE:
+            if ((rx_length == 34) && joybus_check_address_crc(address_with_crc)) {
+                switch (accessory_inserted) {
+                    case ACC_NONE:
+                        break;
+
+                    case ACC_CPAK:
+                        if (address < 32 * 1024) {
+                            memcpy(controller_pak + address, rx_buffer + 2, 32);
+                        }
+                        break;
+
+                    case ACC_RPAK:
+                        if ((address & 0xC000) == 0xC000) {
+                            rumble_on = rx_buffer[33] & 0x01;
+                        }
+                        break;
+                }
+
+                tx_length = 1;
+                tx_buffer[0] = joybus_calculate_data_crc(rx_buffer + 2);
+            }
+            break;
+
+        default:
+            printf("Unknown command received: 0x%02X, length: %d\n", cmd, rx_length);
+            printf_hexdump(rx_buffer, rx_length);
             break;
     }
 
@@ -65,6 +123,7 @@ static void hid_handle_input_report (uint8_t service_index, const uint8_t *repor
 
     int32_t tmp_value;
     uint32_t tmp_state = 0;
+    bool configuration_mode = false;
 
     while (btstack_hid_parser_has_more(&parser)) {
         btstack_hid_parser_get_field(&parser, &usage_page, &usage, &value);
@@ -124,7 +183,6 @@ static void hid_handle_input_report (uint8_t service_index, const uint8_t *repor
                         break;
                     case 0xC5: // Brake
                         if (value > 0x3F) {
-                            // tmp_state |= (1 << 21); // L
                             tmp_state |= (1 << 29); // Z
                         }
                         break;
@@ -143,11 +201,9 @@ static void hid_handle_input_report (uint8_t service_index, const uint8_t *repor
                         tmp_state |= (value << 30); // B
                         break;
                     case 0x05: // Y
-                        // tmp_state |= (value << 17); // CL
                         tmp_state |= (value << 19); // CU
                         break;
                     case 0x07: // L
-                        // tmp_state |= (value << 29); // Z
                         tmp_state |= (value << 17); // CL
                         break;
                     case 0x08: // R
@@ -160,13 +216,13 @@ static void hid_handle_input_report (uint8_t service_index, const uint8_t *repor
                         tmp_state |= (value << 28); // Start
                         break;
                     case 0x0D: // XBOX
-                        tmp_state |= (value << 23); // Reset
+                        // N64RGB reset combination (A + B + Z + Start + R)
+                        tmp_state |= value ? ((1 << 31) | (1 << 30) | (1 << 29) | (1 << 28) | (1 << 20)) : 0;
                         break;
                     case 0x0E: // LS
-                        // tmp_state |= (value << 19); // CU
+                        tmp_state |= (value << 21); // L
                         break;
                     case 0x0F: // RS
-                        // tmp_state |= (value << 23); // Reset
                         break;
                 }
                 break;
@@ -174,15 +230,32 @@ static void hid_handle_input_report (uint8_t service_index, const uint8_t *repor
             case 0x0C: // Consumer Page
                 switch (usage) {
                     case 0xB2: // Record
-                        // tmp_state |= (value << 19); // CU
-                        tmp_state |= (value << 21); // L
+                        configuration_mode = value;
                         break;
                 }
                 break;
         }
     }
 
-    joybus_state = tmp_state;
+    if (configuration_mode) {
+        if (tmp_state & (1 << 26)) { // DD
+            accessory_inserted = ACC_NONE;
+        } else if (tmp_state & (1 << 25)) { // DL
+            accessory_inserted = ACC_RPAK;
+        } else if (tmp_state & (1 << 24)) { // DR
+            accessory_inserted = ACC_CPAK;
+        }
+
+        controller_state = 0;
+    } else {
+        // Handle L + R + Start button combo
+        if ((tmp_state & ((1 << 28) | (1 << 21) | (1 << 20))) == ((1 << 28) | (1 << 21) | (1 << 20))) {
+            tmp_state &= ~(1 << 28); // Clear "Start" button
+            tmp_state |= (1 << 23); // Set hidden "Reset" button
+        }
+
+        controller_state = tmp_state;
+    }
 }
 
 
@@ -243,7 +316,7 @@ static void hci_packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *
             hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
             hids_client_disconnect(hids_cid);
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-            joybus_state = 0;
+            controller_state = 0;
             gap_connect_with_whitelist();
             break;
         }
@@ -330,6 +403,28 @@ static btstack_packet_callback_registration_t sm_event_callback_registration;
 
 static uint8_t hid_descriptor_storage[512];
 
+static uint8_t fb_on[8] = {
+    0x03, // enable
+    0x00, // mag_lt
+    0x00, // mag_rt
+    0x1E, // mag_l
+    0x1E, // mag_r
+    0xFF, // duration
+    0x00, // delay
+    0x00, // cnt
+};
+
+static uint8_t fb_off[8] = {
+    0x03, // enable
+    0x00, // mag_lt
+    0x00, // mag_rt
+    0x00, // mag_l
+    0x00, // mag_r
+    0xFF, // duration
+    0x00, // delay
+    0xFF, // cnt
+};
+
 int main (void) {
     stdio_init_all();
 
@@ -361,7 +456,18 @@ int main (void) {
 
     hci_power_control(HCI_POWER_ON);
 
-    while (true) {
+    bool rumble_state = false;
 
+    while (true) {
+        if (rumble_state ^ rumble_on) {
+            rumble_state = !rumble_state;
+            while (true) {
+                // FIXME: There's bug in the btstack that prevents this function from working more than once
+                // btstack/src/ble/gatt-service/hids_client.c:813 - callback parameter in `gatt_client_write_value_of_characteristic` should be `handle_gatt_client_event` instead of `handle_report_event`
+                if (hids_client_send_write_report(hids_cid, 3, HID_REPORT_TYPE_OUTPUT, rumble_state ? fb_on : fb_off, 8) == ERROR_CODE_SUCCESS) {
+                    break;
+                }
+            }
+        }
     }
 }

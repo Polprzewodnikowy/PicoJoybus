@@ -12,7 +12,7 @@ RUN pacman -Syu --noconfirm \
         arm-none-eabi-newlib
 
 ARG SDK_PATH=/usr/share/pico-sdk
-RUN git clone --depth 1 --branch 1.5.0 https://github.com/raspberrypi/pico-sdk $SDK_PATH && \
+RUN git clone --depth 1 --branch 1.5.1 https://github.com/raspberrypi/pico-sdk $SDK_PATH && \
     cd $SDK_PATH && \
     git submodule update --init
 
