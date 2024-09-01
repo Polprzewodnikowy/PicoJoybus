@@ -60,6 +60,44 @@ static const uint8_t __not_in_flash("joybus") joybus_data_crc_table[256] = {
 };
 
 
+static void __time_critical_func(joybus_start_receive_data) (uint ch) {
+    joybus_channel_t *channel = &joybus->channel[ch];
+
+    dma_channel_abort(channel->dma.id);
+    dma_channel_set_config(channel->dma.id, &channel->dma.rx, false);
+    dma_channel_set_read_addr(channel->dma.id, &joybus->pio->rxf[channel->sm], false);
+
+    dma_channel_transfer_to_buffer_now(channel->dma.id, channel->rx.data, JOYBUS_BUFFER_SIZE);
+}
+
+static void __time_critical_func(joybus_finish_receive_data) (uint ch) {
+    joybus_channel_t *channel = &joybus->channel[ch];
+    dma_channel_hw_t *dma = dma_channel_hw_addr(channel->dma.id);
+
+    uint32_t count = (JOYBUS_BUFFER_SIZE - dma->transfer_count);
+
+    dma_channel_abort(channel->dma.id);
+
+    channel->rx.length = 0;
+
+    if ((count >= 2) && (channel->rx.data[count - 1] == (1 << 0))) {
+        channel->rx.length = (count - 1);
+    }
+}
+
+static void __time_critical_func(joybus_start_transmit_data) (uint ch) {
+    joybus_channel_t *channel = &joybus->channel[ch];
+
+    pio_sm_put(joybus->pio, channel->sm, channel->tx.length * 8);
+
+    dma_channel_set_config(channel->dma.id, &channel->dma.tx, false);
+    dma_channel_set_write_addr(channel->dma.id, &joybus->pio->txf[channel->sm], false);
+    dma_channel_transfer_from_buffer_now(channel->dma.id, channel->tx.data, channel->tx.length);
+
+    uint jmp_to_tx_start = pio_encode_jmp(joybus->offset + joybus_offset_tx_start);
+    pio_sm_exec_wait_blocking(joybus->pio, channel->sm, jmp_to_tx_start);
+}
+
 static inline void __time_critical_func(joybus_process_packet) (uint8_t ch) {
     joybus_channel_t *channel = &joybus->channel[ch];
 
@@ -78,31 +116,6 @@ static inline void __time_critical_func(joybus_process_packet) (uint8_t ch) {
         &channel->rx.data[1],
         channel->tx.data
     );
-}
-
-static void __time_critical_func(joybus_finish_receive_data) (uint ch) {
-    joybus_channel_t *channel = &joybus->channel[ch];
-    dma_channel_hw_t *dma = dma_channel_hw_addr(channel->dma.id);
-    channel->rx.length = (JOYBUS_BUFFER_SIZE - dma->transfer_count);
-    dma_channel_abort(channel->dma.id);
-}
-
-static void __time_critical_func(joybus_start_receive_data) (uint ch) {
-    joybus_channel_t *channel = &joybus->channel[ch];
-    dma_channel_abort(channel->dma.id);
-    dma_channel_set_config(channel->dma.id, &channel->dma.rx, false);
-    dma_channel_set_read_addr(channel->dma.id, &joybus->pio->rxf[channel->sm], false);
-    dma_channel_transfer_to_buffer_now(channel->dma.id, channel->rx.data, JOYBUS_BUFFER_SIZE);
-}
-
-static void __time_critical_func(joybus_start_transmit_data) (uint ch) {
-    joybus_channel_t *channel = &joybus->channel[ch];
-    pio_sm_put(joybus->pio, channel->sm, channel->tx.length * 8);
-    dma_channel_set_config(channel->dma.id, &channel->dma.tx, false);
-    dma_channel_set_write_addr(channel->dma.id, &joybus->pio->txf[channel->sm], false);
-    dma_channel_transfer_from_buffer_now(channel->dma.id, channel->tx.data, channel->tx.length);
-    uint jmp_to_tx_start = pio_encode_jmp(joybus->offset + joybus_offset_tx_start);
-    pio_sm_exec_wait_blocking(joybus->pio, channel->sm, jmp_to_tx_start);
 }
 
 static void __time_critical_func(joybus_pio_irq_handler) (void) {
@@ -135,9 +148,9 @@ static void joybus_program_init (PIO pio, uint sm, uint offset, uint pin) {
     sm_config_set_jmp_pin(&c, pin);
 
     sm_config_set_out_shift(&c, false, true, 8);
-    sm_config_set_in_shift(&c, false, false, 8);
+    sm_config_set_in_shift(&c, false, true, 8);
 
-    float div = ((float) (clock_get_hz(clk_sys))) / (32 * 250000);
+    float div = ((float) (clock_get_hz(clk_sys))) / (64 * 250000);
     sm_config_set_clkdiv(&c, div);
 
     gpio_pull_up(pin);
@@ -173,8 +186,7 @@ static void joybus_dma_init (PIO pio, joybus_channel_t *channel) {
 
 void joybus_init (PIO pio, uint8_t channels, uint *pins, joybus_callback_t callback) {
     assert(!joybus);
-    assert(channels > 0);
-    assert(channels <= 4);
+    assert((channels >= 1) && (channels <= 4));
     assert(pins);
     assert(callback);
 

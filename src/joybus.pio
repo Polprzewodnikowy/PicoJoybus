@@ -1,35 +1,41 @@
 .program joybus
 
 .wrap_target
-rx_tx_stop:
+joybus_done:
     irq set 0 rel
-rx_good_data:
-    push iffull noblock
+
 public rx_start:
     wait 1 pin 0
     wait 0 pin 0
-    mov isr, null
-    set x, 7 [13]
-rx_bit_loop:
-    in pins, 1
-    jmp !x rx_data [8]
-    nop [8]
-    jmp pin rx_tx_stop
-    jmp x-- rx_bit_loop [12]
-rx_data:
-    jmp pin rx_good_data
-rx_bad_data:
-    jmp rx_start
+rx_pulse_start:
+    set x, 15
+    set y, 1
+rx_pulse_loop:
+    jmp pin rx_pulse_done
+    jmp x-- rx_pulse_loop
+    set y, 0
+    jmp rx_pulse_loop
+rx_pulse_done:
+    in y, 1
+    set x, 31
+rx_timeout_loop:
+    jmp pin rx_timeout_loop_2
+    jmp rx_pulse_start
+rx_timeout_loop_2:
+    jmp x-- rx_timeout_loop
+rx_timeout:
+    push noblock
+    jmp joybus_done
 
 public tx_start:
     out x, 32
 tx_bit_loop:
     set pindirs, 0
-    jmp !x tx_stop [7]
-    out pindirs, 1 [14]
-    set pindirs, 1 [6]
+    jmp !x tx_stop [14]
+    out pindirs, 1 [31]
+    set pindirs, 1 [14]
     jmp x-- tx_bit_loop
 tx_stop:
-    nop [6]
+    nop [14]
     set pindirs, 1
 .wrap

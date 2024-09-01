@@ -14,6 +14,6 @@ RUN pacman -Syu --noconfirm \
 ARG SDK_PATH=/usr/share/pico-sdk
 RUN git clone --depth 1 --branch 1.5.1 https://github.com/raspberrypi/pico-sdk $SDK_PATH && \
     cd $SDK_PATH && \
-    git submodule update --init
+    git submodule update --init --depth 1
 
 ENV PICO_SDK_PATH=$SDK_PATH
